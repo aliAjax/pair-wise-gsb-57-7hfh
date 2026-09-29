@@ -47,7 +47,7 @@ import {
   type RequestStatus,
   type RequestType,
 } from '@/lib/schemas'
-import { deadlineState, templateName } from '@/services/workflow'
+import { deadlineState, receiptStatus, templateName } from '@/services/workflow'
 
 const initialForm = {
   requesterName: '',
@@ -185,6 +185,7 @@ export function RequestListPage() {
             <Tbody>
               {filtered.map((request) => {
                 const deadline = deadlineState(request.dueAt)
+                const receipt = receiptStatus(request)
                 return (
                   <Tr key={request.id}>
                     <Td className="mono">{request.code}</Td>
@@ -198,7 +199,14 @@ export function RequestListPage() {
                       <TypeBadge type={request.type} />
                     </Td>
                     <Td>{regionLabels[request.region]}</Td>
-                    <Td>{request.affectedSystemIds.length} 个</Td>
+                    <Td>
+                      <Text>{request.affectedSystemIds.length} 个</Text>
+                      {!['completed', 'rejected'].includes(request.status) ? (
+                        <Text color={receipt.allAccepted ? 'green.600' : 'orange.600'} fontSize="xs">
+                          回执 {receipt.acceptedSystemIds.length}/{request.affectedSystemIds.length}
+                        </Text>
+                      ) : null}
+                    </Td>
                     <Td>
                       <StatusBadge status={request.status} />
                     </Td>
@@ -213,6 +221,13 @@ export function RequestListPage() {
                         ) : null}
                         {request.conflicts.length ? (
                           <Badge colorScheme="red">{request.conflicts.length} 项冲突</Badge>
+                        ) : null}
+                        {!receipt.allAccepted &&
+                        request.identity.status === 'verified' &&
+                        !['completed', 'rejected'].includes(request.status) ? (
+                          <Badge colorScheme="orange">
+                            等待 {receipt.waitingSystems.length} 个系统回执
+                          </Badge>
                         ) : null}
                       </HStack>
                     </Td>

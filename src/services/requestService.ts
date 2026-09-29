@@ -3,13 +3,22 @@ import type {
   PrivacyRequest,
   RequestStatus,
   RequestType,
+  SystemReceipt,
   WorkspaceState,
 } from '@/types/domain'
-import { addDays, buildWorkflowSteps, responseDays } from './workflow'
+import { addDays, buildWorkflowSteps, freezeDeadlineTemplate, receiptStatus, responseDays } from './workflow'
 
 const cloneState = (state: WorkspaceState): WorkspaceState => structuredClone(state)
 const now = () => new Date().toISOString()
 const id = (prefix: string) => `${prefix}-${crypto.randomUUID()}`
+
+/** 处理动作绑定的版本与请求当前版本不一致（旧页面整包保存）时抛出 */
+export class StaleVersionError extends Error {
+  constructor(expected: number, current: number) {
+    super(`版本冲突：该动作绑定 v${expected}，请求已被其他页面或系统更新到 v${current}，请刷新后基于当前版本重试。`)
+    this.name = 'StaleVersionError'
+  }
+}
 
 function digest(value: string): string {
   let hash = 2166136261
@@ -26,6 +35,7 @@ function appendAudit(
   action: string,
   operator: string,
   detail: string,
+  createdAt?: string,
 ) {
   const entry = {
     id: id('audit'),
@@ -33,7 +43,7 @@ function appendAudit(
     action,
     operator,
     detail,
-    createdAt: now(),
+    createdAt: createdAt ?? now(),
   }
   state.audit.unshift(entry)
   request.audit.unshift({
@@ -45,17 +55,34 @@ function appendAudit(
   })
 }
 
+interface AuditSpec {
+  action: string
+  operator: string
+  detail: string | ((request: PrivacyRequest) => string)
+}
+
 function mutateRequest(
   state: WorkspaceState,
   requestId: string,
-  mutation: (request: PrivacyRequest, draft: WorkspaceState) => void,
-  audit: { action: string; operator: string; detail: string },
+  expectedVersion: number,
+  mutation: (request: PrivacyRequest, draft: WorkspaceState) => AuditSpec | void,
+  fallbackAudit?: AuditSpec,
 ): WorkspaceState {
   const draft = cloneState(state)
   const request = draft.requests.find((item) => item.id === requestId)
   if (!request) throw new Error('请求不存在')
-  mutation(request, draft)
-  appendAudit(draft, request, audit.action, audit.operator, audit.detail)
+  if (request.version !== expectedVersion) {
+    throw new StaleVersionError(expectedVersion, request.version)
+  }
+  const auditOverride = mutation(request, draft) ?? fallbackAudit
+  if (auditOverride) {
+    const detail =
+      typeof auditOverride.detail === 'function'
+        ? auditOverride.detail(request)
+        : auditOverride.detail
+    appendAudit(draft, request, auditOverride.action, auditOverride.operator, detail)
+  }
+  request.version += 1
   draft.revision += 1
   return draft
 }
@@ -78,7 +105,9 @@ export function createRequest(
 ): WorkspaceState {
   const draft = cloneState(state)
   const requestedAt = now()
-  const dueAt = addDays(new Date(requestedAt), responseDays[input.region]).toISOString()
+  // 期限按登记时的地区模板冻结：响应天数与模板版本一起快照到请求上
+  const template = freezeDeadlineTemplate(input.region, requestedAt)
+  const dueAt = addDays(new Date(requestedAt), template.days).toISOString()
   const duplicate = draft.requests.find(
     (request) =>
       request.requesterContact === input.requesterContact &&
@@ -97,6 +126,7 @@ export function createRequest(
   const request: PrivacyRequest = {
     id: requestId,
     code: `DSR-2026-${String(nextNumber).padStart(3, '0')}`,
+    version: 0,
     requesterName: input.requesterName.trim(),
     requesterContact: input.requesterContact.trim(),
     region: input.region,
@@ -111,6 +141,7 @@ export function createRequest(
     },
     requestedAt,
     dueAt,
+    deadlineTemplate: template,
     extendedDays: 0,
     duplicateOf: duplicate?.code,
     affectedSystemIds: [...input.affectedSystemIds],
@@ -124,6 +155,7 @@ export function createRequest(
       systems: draft.systems,
     }),
     evidence: [],
+    systemReceipts: [],
     conflicts: [],
     resultSummary: '',
     closureReason: '',
@@ -146,32 +178,48 @@ export function createRequest(
     request,
     '登记隐私请求',
     operator,
-    `按 ${responseDays[input.region]} 日模板登记，涉及 ${input.affectedSystemIds.length} 个系统。`,
+    `按 ${template.templateVersion} 版 ${regionTemplateLabel(input.region)} ${template.days} 日期限模板登记并冻结期限，涉及 ${input.affectedSystemIds.length} 个系统；新模板不再影响本请求。`,
+    requestedAt,
   )
+  request.version = 1
   draft.revision += 1
   return draft
+}
+
+function regionTemplateLabel(region: keyof typeof responseDays): string {
+  const labels: Record<keyof typeof responseDays, string> = {
+    cn: '中国大陆',
+    eu: '欧盟',
+    us: '美国加州',
+    sg: '新加坡',
+  }
+  return labels[region]
 }
 
 export function saveRequest(
   state: WorkspaceState,
   requestId: string,
-  patch: Partial<PrivacyRequest>,
+  expectedVersion: number,
+  patch: Partial<Pick<PrivacyRequest, 'requesterName' | 'requesterContact'>>,
   operator: string,
 ): WorkspaceState {
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
-      Object.assign(request, patch)
-      request.audit = request.audit
+      // 基本信息更新走白名单，整包保存不得覆盖任务、证据、回执、审计和冻结模板
+      if (patch.requesterName !== undefined) request.requesterName = patch.requesterName
+      if (patch.requesterContact !== undefined) request.requesterContact = patch.requesterContact
     },
-    { action: '更新请求信息', operator, detail: '更新申请人、地区、请求类型或涉及系统。' },
+    { action: '更新请求信息', operator, detail: '更新请求人或联系方式；地区、类型、系统与期限模板保持登记时冻结值。' },
   )
 }
 
 export function verifyIdentity(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   status: 'verified' | 'insufficient',
   note: string,
   operator: string,
@@ -179,6 +227,7 @@ export function verifyIdentity(
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       request.identity.status = status
       request.identity.note = note
@@ -218,6 +267,7 @@ export function verifyIdentity(
 export function assignTask(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   taskId: string,
   assignee: string,
   operator: string,
@@ -225,6 +275,7 @@ export function assignTask(
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       const task = request.tasks.find((item) => item.id === taskId)
       if (!task) throw new Error('任务不存在')
@@ -237,6 +288,7 @@ export function assignTask(
 export function taskAction(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   taskId: string,
   action: 'start' | 'complete' | 'block',
   note: string,
@@ -245,6 +297,7 @@ export function taskAction(
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       if (request.identity.status !== 'verified') {
         throw new Error('身份未核验通过，不能推进履约任务')
@@ -255,6 +308,18 @@ export function taskAction(
         task.status = 'active'
         task.exceptionReason = ''
       } else if (action === 'complete') {
+        if (task.id.endsWith('-merge')) {
+          // 跨系统回执全部到齐后才允许合并，防止先合并后盖掉其他系统结果
+          const status = receiptStatus(request)
+          if (!status.allAccepted) {
+            throw new Error(
+              `仍有 ${status.waitingSystems.length} 个系统回执未到齐，不能合并跨系统结果`,
+            )
+          }
+        }
+        if (task.id.endsWith('-review') && request.conflicts.length) {
+          throw new Error('冲突未复核完成，不能完成复核步骤')
+        }
         task.status = 'completed'
         task.completedAt = now()
         task.exceptionReason = ''
@@ -285,6 +350,7 @@ export function taskAction(
 export function addEvidence(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   taskId: string,
   name: string,
   evidenceType: 'execution-log' | 'screenshot' | 'signed-record' | 'system-response',
@@ -293,6 +359,7 @@ export function addEvidence(
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       const task = request.tasks.find((item) => item.id === taskId)
       if (!task) throw new Error('任务不存在')
@@ -301,10 +368,11 @@ export function addEvidence(
         stepId: taskId,
         name,
         evidenceType,
-        digest: digest(`${name}-${now()}`),
+        digest: digest(`${name}-${taskId}-${now()}`),
         uploadedBy: operator,
         uploadedAt: now(),
         protected: true,
+        source: 'manual',
       })
     },
     {
@@ -315,15 +383,150 @@ export function addEvidence(
   )
 }
 
+export interface RegisterReceiptResult {
+  receipt: SystemReceipt
+  duplicated: boolean
+}
+
+/**
+ * 登记跨系统处理回执（含超时重发）。
+ * 同一 (systemId, receiptKey) 视为同一笔：首次接受会生成证据并推进系统任务；
+ * 重发只追加投递记录，不重复生成证据、不重复推进任务。
+ */
+export function registerSystemReceipt(
+  state: WorkspaceState,
+  requestId: string,
+  expectedVersion: number,
+  systemId: string,
+  receiptKey: string,
+  result: 'accepted' | 'failed',
+  summary: string,
+  note: string,
+  operator: string,
+): WorkspaceState {
+  return mutateRequest(
+    state,
+    requestId,
+    expectedVersion,
+    (request, draft) => {
+      if (!request.affectedSystemIds.includes(systemId)) {
+        throw new Error('该系统不在本请求涉及系统范围内')
+      }
+      if (request.identity.status !== 'verified') {
+        throw new Error('身份未核验通过，不能登记系统回执')
+      }
+      const system = draft.systems.find((item) => item.id === systemId)
+      const systemName = system?.name ?? systemId
+      const existing = request.systemReceipts.find(
+        (item) => item.systemId === systemId && item.receiptKey === receiptKey,
+      )
+      const deliveredAt = now()
+
+      if (existing) {
+        // 同一笔回执的超时重发：幂等确认，仅留痕
+        existing.redeliveries.push({
+          deliveredAt,
+          operator,
+          note: note || `回执 ${receiptKey} 超时重发，按同一笔回执确认。`,
+        })
+        existing.lastDeliveryAt = deliveredAt
+        existing.deliveryCount += 1
+        return {
+          action: '系统回执重发（按同一笔确认）',
+          operator,
+          detail: `${systemName} 回执 ${receiptKey} 第 ${existing.deliveryCount} 次送达，与首次接受为同一笔：不重复生成证据、不重复推进任务。`,
+        }
+      }
+
+      const receipt: SystemReceipt = {
+        id: id('receipt'),
+        systemId,
+        receiptKey,
+        status: result,
+        summary,
+        receivedAt: deliveredAt,
+        lastDeliveryAt: deliveredAt,
+        deliveryCount: 1,
+        operator,
+        redeliveries: [],
+      }
+
+      if (result === 'accepted') {
+        // 首次接受：为该系统生成唯一一份回执证据，并完成定位/执行任务
+        request.evidence.push({
+          id: id('evidence'),
+          stepId: `${request.id}-execute-${systemId}`,
+          name: `${systemName}处理回执（${receiptKey}）`,
+          evidenceType: 'system-response',
+          digest: digest(`${request.id}-${systemId}-${receiptKey}`),
+          uploadedBy: operator,
+          uploadedAt: deliveredAt,
+          protected: true,
+          receiptKey,
+          source: 'receipt',
+        })
+        for (const task of request.tasks) {
+          if (
+            task.systemId === systemId &&
+            (task.id.includes('-locate-') || task.id.includes('-execute-')) &&
+            task.status !== 'completed'
+          ) {
+            task.status = 'completed'
+            task.completedAt = deliveredAt
+            task.exceptionReason = ''
+          }
+        }
+      } else {
+        const conflictText = `系统回执例外：${systemName} 回执 ${receiptKey} 返回失败——${summary}`
+        receipt.conflict = conflictText
+        request.conflicts.push(conflictText)
+        const executeTask = request.tasks.find(
+          (task) => task.systemId === systemId && task.id.includes('-execute-'),
+        )
+        if (executeTask && executeTask.status !== 'completed') {
+          executeTask.status = 'blocked'
+          executeTask.exceptionReason = summary
+        }
+        request.status = 'review-required'
+      }
+
+      request.systemReceipts.push(receipt)
+
+      const status = receiptStatus(request)
+      if (result === 'accepted') {
+        if (status.allAccepted) {
+          // 全部系统回执到齐：激活合并步骤，等待人工合并
+          const mergeTask = request.tasks.find((task) => task.id.endsWith('-merge'))
+          if (mergeTask && mergeTask.status === 'pending') mergeTask.status = 'active'
+          if (!request.conflicts.length) request.status = 'processing'
+        } else if (!request.conflicts.length) {
+          request.status = 'processing'
+        }
+      }
+
+      return {
+        action: result === 'accepted' ? '接受系统处理回执' : '系统回执失败进入复核',
+        operator,
+        detail:
+          result === 'accepted'
+            ? `接受 ${systemName} 回执 ${receiptKey}：${summary}。回执到齐 ${status.acceptedSystemIds.length}/${request.affectedSystemIds.length}${status.allAccepted ? '，已激活跨系统结果合并。' : `，等待 ${status.waitingSystems.length} 个系统。`}`
+            : `${systemName} 回执 ${receiptKey} 返回失败：${summary}，冲突未复核前不能关闭。`,
+      }
+    },
+  )
+}
+
 export function addConflict(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   conflict: string,
   operator: string,
 ): WorkspaceState {
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       request.conflicts.push(conflict)
       request.status = 'review-required'
@@ -335,6 +538,7 @@ export function addConflict(
 export function resolveConflict(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   conflictIndex: number,
   resolution: string,
   operator: string,
@@ -342,12 +546,15 @@ export function resolveConflict(
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       const conflict = request.conflicts[conflictIndex]
       if (!conflict) throw new Error('冲突项不存在')
       request.conflicts.splice(conflictIndex, 1)
       if (!request.conflicts.length && request.identity.status === 'verified') {
-        request.status = 'processing'
+        // 回执到齐且冲突清空后才回到待合并/处理中，冲突未复核前保持复核状态、禁止关闭
+        const status = receiptStatus(request)
+        request.status = status.allAccepted ? 'processing' : 'review-required'
       } else {
         request.status = 'review-required'
       }
@@ -359,6 +566,7 @@ export function resolveConflict(
 export function extendRequest(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   days: number,
   reason: string,
   operator: string,
@@ -366,19 +574,26 @@ export function extendRequest(
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       const base = new Date(request.dueAt) > new Date() ? new Date(request.dueAt) : new Date()
       request.dueAt = addDays(base, days).toISOString()
       request.extendedDays += days
       request.status = 'extended'
     },
-    { action: '延期请求处理', operator, detail: `延期 ${days} 天：${reason}` },
+    {
+      action: '延期请求处理',
+      operator,
+      detail: (request) =>
+        `在冻结模板（${request.deadlineTemplate.templateVersion}，${request.deadlineTemplate.days} 日）基础上延期 ${days} 天：${reason}`,
+    },
   )
 }
 
 export function closeRequest(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   resultSummary: string,
   closureReason: string,
   operator: string,
@@ -386,6 +601,7 @@ export function closeRequest(
   return mutateRequest(
     state,
     requestId,
+    expectedVersion,
     (request) => {
       if (request.identity.status !== 'verified') {
         throw new Error('身份核验尚未通过，不能关闭请求')
@@ -395,7 +611,11 @@ export function closeRequest(
         throw new Error('仍有未完成任务，不能关闭请求')
       }
       if (request.conflicts.length) {
-        throw new Error('仍有未解决冲突，不能关闭请求')
+        throw new Error('仍有未复核冲突，不能关闭请求')
+      }
+      const status = receiptStatus(request)
+      if (!status.allAccepted) {
+        throw new Error('跨系统回执未全部到齐，不能合并关闭')
       }
       if (new Date(request.dueAt) > new Date() && !closureReason.trim()) {
         throw new Error('截止时间前关闭必须填写提前关闭理由')
@@ -420,20 +640,26 @@ export function closeRequest(
 export function addComment(
   state: WorkspaceState,
   requestId: string,
+  expectedVersion: number,
   content: string,
   operator: string,
 ): WorkspaceState {
   const draft = cloneState(state)
   const request = draft.requests.find((item) => item.id === requestId)
   if (!request) throw new Error('请求不存在')
+  if (request.version !== expectedVersion) {
+    throw new StaleVersionError(expectedVersion, request.version)
+  }
+  const createdAt = now()
   draft.comments.unshift({
     id: id('comment'),
     requestId,
     author: operator,
     content,
-    createdAt: now(),
+    createdAt,
   })
-  appendAudit(draft, request, '提交处理意见', operator, content)
+  appendAudit(draft, request, '提交处理意见', operator, content, createdAt)
+  request.version += 1
   draft.revision += 1
   return draft
 }

@@ -1,9 +1,18 @@
 import type {
   DataSystem,
+  DeadlineTemplate,
   RequestStatus,
   RequestType,
+  SystemReceipt,
   WorkflowStep,
 } from '@/types/domain'
+
+/**
+ * 当前生效的地区期限模板版本。
+ * 调整天数只会影响之后登记的请求：每个请求在登记时冻结一份模板快照，
+ * 旧请求继续沿用自己的到期日。
+ */
+export const DEADLINE_TEMPLATE_VERSION = '2026-v1'
 
 export const responseDays = {
   cn: 30,
@@ -12,10 +21,54 @@ export const responseDays = {
   sg: 30,
 } as const
 
+export function freezeDeadlineTemplate(
+  region: keyof typeof responseDays,
+  frozenAt: string,
+): DeadlineTemplate {
+  return {
+    region,
+    days: responseDays[region],
+    templateVersion: DEADLINE_TEMPLATE_VERSION,
+    frozenAt,
+  }
+}
+
 export function addDays(date: Date, days: number): Date {
   const next = new Date(date)
   next.setDate(next.getDate() + days)
   return next
+}
+
+/**
+ * 跨系统回执到齐情况：用于判断能否合并以及请求当前卡在哪个系统。
+ */
+export function receiptStatus(request: {
+  affectedSystemIds: string[]
+  systemReceipts: SystemReceipt[]
+}) {
+  const accepted = new Map(
+    request.systemReceipts
+      .filter((receipt) => receipt.status === 'accepted')
+      .map((receipt) => [receipt.systemId, receipt]),
+  )
+  const failed = new Map(
+    request.systemReceipts
+      .filter((receipt) => receipt.status === 'failed')
+      .map((receipt) => [receipt.systemId, receipt]),
+  )
+  const acceptedSystemIds = [...accepted.keys()]
+  const waitingSystems = request.affectedSystemIds.filter(
+    (systemId) => !accepted.has(systemId),
+  )
+  const failedSystemIds = [...failed.keys()].filter((systemId) =>
+    waitingSystems.includes(systemId),
+  )
+  return {
+    acceptedSystemIds,
+    waitingSystems,
+    failedSystemIds,
+    allAccepted: waitingSystems.length === 0,
+  }
 }
 
 export function buildWorkflowSteps(params: {

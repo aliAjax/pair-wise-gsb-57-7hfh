@@ -7,7 +7,6 @@ import {
   Badge,
   Box,
   Button,
-  Checkbox,
   Divider,
   Flex,
   FormControl,
@@ -38,7 +37,7 @@ import {
   useDisclosure,
   useToast,
 } from '@chakra-ui/react'
-import { ArrowLeft, FileCheck2, Link2Off, ShieldAlert } from 'lucide-react'
+import { ArrowLeft, FileCheck2, Inbox, Link2Off, ShieldAlert } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { StatusBadge, TypeBadge } from '@/components/StatusBadge'
 import {
@@ -48,6 +47,7 @@ import {
   useAssignTaskMutation,
   useCloseRequestMutation,
   useExtendRequestMutation,
+  useRegisterReceiptMutation,
   useResolveConflictMutation,
   useSaveRequestMutation,
   useTaskActionMutation,
@@ -61,13 +61,15 @@ import {
   type RequestType,
   type WorkflowStep,
 } from '@/lib/schemas'
-import { deadlineState } from '@/services/workflow'
+import { deadlineState, receiptStatus } from '@/services/workflow'
+import type { DataSystem } from '@/types/domain'
 
 type DialogType =
   | 'edit'
   | 'identity'
   | 'assign'
   | 'evidence'
+  | 'receipt'
   | 'block'
   | 'conflict'
   | 'resolve'
@@ -82,6 +84,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   const request = data?.requests.find((item) => item.id === requestId)
   const [dialog, setDialog] = useState<DialogType>(null)
   const [selectedTask, setSelectedTask] = useState<WorkflowStep>()
+  const [selectedSystem, setSelectedSystem] = useState<DataSystem>()
   const [conflictIndex, setConflictIndex] = useState(0)
   const [content, setContent] = useState('')
   const [assignee, setAssignee] = useState('')
@@ -89,6 +92,8 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   const [evidenceType, setEvidenceType] = useState<
     'execution-log' | 'screenshot' | 'signed-record' | 'system-response'
   >('execution-log')
+  const [receiptKey, setReceiptKey] = useState('')
+  const [receiptResult, setReceiptResult] = useState<'accepted' | 'failed'>('accepted')
   const [extendDays, setExtendDays] = useState(15)
   const [editForm, setEditForm] = useState({
     requesterName: '',
@@ -103,6 +108,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   const assignTask = useAssignTaskMutation()
   const taskAction = useTaskActionMutation()
   const addEvidence = useAddEvidenceMutation()
+  const registerReceipt = useRegisterReceiptMutation()
   const addConflict = useAddConflictMutation()
   const resolveConflict = useResolveConflictMutation()
   const extendRequest = useExtendRequestMutation()
@@ -121,14 +127,38 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   const completedTasks = request.tasks.filter((task) => task.status === 'completed').length
   const currentTask = request.tasks.find((task) => task.status === 'active')
   const systems = data.systems.filter((system) => request.affectedSystemIds.includes(system.id))
+  const receipt = receiptStatus(request)
+  const receiptBySystem = new Map(
+    request.systemReceipts.map((item) => [item.systemId, item]),
+  )
+  const blockedSystems = receipt.waitingSystems.filter((systemId) =>
+    request.tasks.some(
+      (task) => task.systemId === systemId && task.status === 'blocked',
+    ),
+  )
+  const waitingSystems = receipt.waitingSystems.filter(
+    (systemId) => !blockedSystems.includes(systemId),
+  )
 
-  function openDialog(type: DialogType, task?: WorkflowStep, index = 0) {
+  function openDialog(
+    type: DialogType,
+    taskOrSystem?: WorkflowStep | DataSystem,
+    index = 0,
+  ) {
     if (!request) return
-    setSelectedTask(task)
+    if (type === 'receipt') {
+      const system = taskOrSystem as DataSystem | undefined
+      setSelectedSystem(system)
+      const existing = system ? receiptBySystem.get(system.id) : undefined
+      setReceiptKey(existing?.receiptKey ?? '')
+      setReceiptResult(existing?.status === 'failed' ? 'failed' : 'accepted')
+    } else {
+      setSelectedTask(taskOrSystem as WorkflowStep | undefined)
+    }
     setConflictIndex(index)
     setDialog(type)
     setContent('')
-    if (type === 'assign') setAssignee(task?.assignee ?? '')
+    if (type === 'assign') setAssignee((taskOrSystem as WorkflowStep)?.assignee ?? '')
     if (type === 'edit') {
       setEditForm({
         requesterName: request.requesterName,
@@ -156,13 +186,18 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   }
 
   async function submitDialog() {
-    if (!dialog) return
+    if (!dialog || !request) return
+    const expectedVersion = request.version
     if (dialog === 'edit') {
       await run(
         () =>
           saveRequest.mutateAsync({
             requestId,
-            patch: editForm,
+            expectedVersion,
+            patch: {
+              requesterName: editForm.requesterName,
+              requesterContact: editForm.requesterContact,
+            },
             operator: '隐私运营',
           }),
         '请求信息已保存',
@@ -172,6 +207,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
         () =>
           verifyIdentity.mutateAsync({
             requestId,
+            expectedVersion,
             status: identityStatus,
             note: content,
             operator: '隐私运营',
@@ -183,6 +219,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
         () =>
           assignTask.mutateAsync({
             requestId,
+            expectedVersion,
             taskId: selectedTask.id,
             assignee,
             operator: '隐私运营',
@@ -194,6 +231,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
         () =>
           addEvidence.mutateAsync({
             requestId,
+            expectedVersion,
             taskId: selectedTask.id,
             name: content,
             evidenceType,
@@ -201,11 +239,27 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
           }),
         '执行证据已受保护登记',
       )
+    } else if (dialog === 'receipt' && selectedSystem) {
+      await run(
+        () =>
+          registerReceipt.mutateAsync({
+            requestId,
+            expectedVersion,
+            systemId: selectedSystem.id,
+            receiptKey: receiptKey.trim(),
+            result: receiptResult,
+            summary: content,
+            note: '',
+            operator: `${selectedSystem.owner}`,
+          }),
+        receiptResult === 'accepted' ? '回执已接受' : '失败回执已进入复核',
+      )
     } else if (dialog === 'block' && selectedTask) {
       await run(
         () =>
           taskAction.mutateAsync({
             requestId,
+            expectedVersion,
             taskId: selectedTask.id,
             action: 'block',
             note: content,
@@ -218,6 +272,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
         () =>
           addConflict.mutateAsync({
             requestId,
+            expectedVersion,
             conflict: content,
             operator: '数据管理员',
           }),
@@ -228,6 +283,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
         () =>
           resolveConflict.mutateAsync({
             requestId,
+            expectedVersion,
             conflictIndex,
             resolution: content,
             operator: '隐私负责人',
@@ -239,6 +295,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
         () =>
           extendRequest.mutateAsync({
             requestId,
+            expectedVersion,
             days: extendDays,
             reason: content,
             operator: '隐私负责人',
@@ -250,6 +307,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
         () =>
           closeRequest.mutateAsync({
             requestId,
+            expectedVersion,
             resultSummary: content,
             closureReason: deadline.overdue ? '' : '已完成全部系统任务，经复核后提前关闭。',
             operator: '隐私负责人',
@@ -260,9 +318,11 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   }
 
   async function taskMutation(task: WorkflowStep, action: 'start' | 'complete') {
+    if (!request) return
     try {
       await taskAction.mutateAsync({
         requestId,
+        expectedVersion: request.version,
         taskId: task.id,
         action,
         note: action === 'start' ? '开始执行任务。' : '任务结果已提交。',
@@ -279,10 +339,11 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   }
 
   const dialogTitle: Record<Exclude<DialogType, null>, string> = {
-    edit: '编辑请求基本信息',
+    edit: '编辑请求基本信息（地区模板已冻结）',
     identity: '身份核验结论',
     assign: '分派履约任务',
     evidence: '登记执行证据',
+    receipt: '登记系统处理回执',
     block: '阻断任务并说明原因',
     conflict: '新增冲突或例外',
     resolve: '记录冲突复核结论',
@@ -321,7 +382,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
             <StatusBadge status={request.status} />
           </Box>
           <Text mt="2" color="gray.500" fontSize="xs">
-            第 {request.extendedDays ? `延期 ${request.extendedDays} 天` : '原期限'}
+            数据版本 v{request.version} · 动作绑定当前版本
           </Text>
         </Box>
         <Box className="metric warning">
@@ -334,33 +395,68 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
           <Text mt="1" color="gray.500" fontSize="xs">
             {new Date(request.dueAt).toLocaleString('zh-CN')}
           </Text>
+          <Text mt="1" color="gray.500" fontSize="xs">
+            冻结模板 {request.deadlineTemplate.templateVersion} ·{' '}
+            {request.deadlineTemplate.days} 日 · {request.extendedDays ? `已延期 ${request.extendedDays} 天` : '原期限'}
+          </Text>
         </Box>
         <Box className="metric info">
           <Text color="gray.600" fontSize="sm">
-            任务完成
+            跨系统回执
           </Text>
           <Heading mt="2" size="md">
-            {completedTasks} / {request.tasks.length}
+            {receipt.acceptedSystemIds.length} / {systems.length}
           </Heading>
           <Progress
             mt="2"
             size="sm"
-            value={(completedTasks / request.tasks.length) * 100}
+            value={(receipt.acceptedSystemIds.length / Math.max(systems.length, 1)) * 100}
             colorScheme="brand"
           />
+          <Text mt="1" color="gray.500" fontSize="xs">
+            {receipt.allAccepted ? '回执已全部到齐，可合并' : `任务完成 ${completedTasks}/${request.tasks.length}`}
+          </Text>
         </Box>
-        <Box className={`metric ${request.conflicts.length ? 'danger' : ''}`}>
+        <Box className={`metric ${request.conflicts.length || blockedSystems.length ? 'danger' : ''}`}>
           <Text color="gray.600" fontSize="sm">
-            冲突与例外
+            冲突与卡住系统
           </Text>
           <Heading mt="2" size="md">
-            {request.conflicts.length}
+            {request.conflicts.length} 项 / {blockedSystems.length} 个
           </Heading>
           <Text mt="1" color="gray.500" fontSize="xs">
-            未解决时禁止关闭
+            冲突未复核、回执未到齐均禁止关闭
           </Text>
         </Box>
       </SimpleGrid>
+
+      {!receipt.allAccepted && request.identity.status === 'verified' ? (
+        <Alert
+          status={blockedSystems.length ? 'error' : 'warning'}
+          mb="4"
+          borderRadius="5px"
+        >
+          <VStack align="stretch" spacing="1">
+            <Text>
+              当前请求{blockedSystems.length ? '卡在' : '等待'}：
+              {[...blockedSystems, ...waitingSystems]
+                .map((systemId) => systems.find((system) => system.id === systemId)?.name ?? systemId)
+                .join('、')}
+              （回执 {receipt.acceptedSystemIds.length}/{systems.length}）。
+            </Text>
+            <Text fontSize="sm">
+              {blockedSystems.length
+                ? '上述系统任务阻断或回执失败，必须完成冲突复核并取得接受回执后才能合并。'
+                : '上述系统尚未返回处理回执；全部回执到齐后才会激活跨系统结果合并。'}
+            </Text>
+          </VStack>
+        </Alert>
+      ) : null}
+      {receipt.allAccepted && request.status !== 'completed' ? (
+        <Alert status="success" mb="4" borderRadius="5px">
+          全部 {systems.length} 个系统回执均已接受，可执行跨系统结果合并；重发回执按同一笔确认，不会重复生成证据。
+        </Alert>
+      ) : null}
 
       {request.conflicts.length ? (
         <Alert status="error" mb="4" borderRadius="5px">
@@ -401,10 +497,14 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
             </Box>
             <Box>
               <Text color="gray.500" fontSize="xs">
-                地区与模板
+                地区与冻结模板
               </Text>
               <Text mt="1">
                 {regionLabels[request.region]} · {requestTypeLabels[request.type]}
+              </Text>
+              <Text mt="1" color="gray.500" fontSize="xs">
+                {request.deadlineTemplate.templateVersion} · 登记时冻结{' '}
+                {request.deadlineTemplate.days} 日，新模板不影响本请求
               </Text>
             </Box>
             <Box>
@@ -448,24 +548,92 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
 
         <Box className="panel">
           <Flex className="panel-title">
-            <Heading size="sm">涉及系统与流程模板</Heading>
-            <Badge colorScheme="blue">{systems.length} 个系统</Badge>
+            <Heading size="sm">跨系统回执（按回执编号幂等）</Heading>
+            <Badge colorScheme="blue">
+              {receipt.acceptedSystemIds.length}/{systems.length} 已接受
+            </Badge>
           </Flex>
           <VStack align="stretch" spacing="3">
-            {systems.map((system) => (
-              <Box key={system.id} p="3" bg="gray.50" borderRadius="5px">
-                <Flex justify="space-between">
-                  <Text fontWeight="600">{system.name}</Text>
-                  <Badge>{system.owner}</Badge>
-                </Flex>
-                <Text mt="1" color="gray.600" fontSize="sm">
-                  {system.dataDomain} · {system.transferMethod}
-                </Text>
-              </Box>
-            ))}
+            {systems.map((system) => {
+              const item = receiptBySystem.get(system.id)
+              const blocked = blockedSystems.includes(system.id)
+              const waiting = waitingSystems.includes(system.id)
+              return (
+                <Box key={system.id} p="3" bg={blocked ? 'red.50' : waiting ? 'orange.50' : 'gray.50'} borderRadius="5px">
+                  <Flex justify="space-between" align="center">
+                    <Box>
+                      <Text fontWeight="600">{system.name}</Text>
+                      <Text color="gray.600" fontSize="sm">
+                        {system.owner} · {system.transferMethod}
+                      </Text>
+                    </Box>
+                    {item ? (
+                      <HStack>
+                        <Badge colorScheme={item.status === 'accepted' ? 'green' : 'red'}>
+                          {item.status === 'accepted' ? '回执已接受' : '回执失败'}
+                        </Badge>
+                        {item.deliveryCount > 1 ? (
+                          <Badge colorScheme="purple">重发 ×{item.deliveryCount - 1}</Badge>
+                        ) : null}
+                      </HStack>
+                    ) : blocked ? (
+                      <Badge colorScheme="red">阻断 · 待复核</Badge>
+                    ) : (
+                      <Badge colorScheme="orange">等待回执</Badge>
+                    )}
+                  </Flex>
+                  {item ? (
+                    <Box mt="2">
+                      <Text fontSize="sm" color="gray.700">
+                        <span className="mono">{item.receiptKey}</span> · {item.summary}
+                      </Text>
+                      <Text mt="1" color="gray.500" fontSize="xs">
+                        首次接受 {new Date(item.receivedAt).toLocaleString('zh-CN')} · 最近送达{' '}
+                        {new Date(item.lastDeliveryAt).toLocaleString('zh-CN')} · 投递 {item.deliveryCount} 次
+                      </Text>
+                      {item.redeliveries.map((redelivery, index) => (
+                        <Text key={index} mt="1" color="purple.700" fontSize="xs">
+                          重发留痕：{new Date(redelivery.deliveredAt).toLocaleString('zh-CN')} ·{' '}
+                          {redelivery.operator} · {redelivery.note}
+                        </Text>
+                      ))}
+                      {item.status === 'accepted' ? (
+                        <Button
+                          mt="2"
+                          size="xs"
+                          variant="outline"
+                          onClick={() => openDialog('receipt', system)}
+                          leftIcon={<Inbox size={13} />}
+                        >
+                          模拟超时重发（同一回执编号）
+                        </Button>
+                      ) : null}
+                    </Box>
+                  ) : (
+                    <Box mt="2">
+                      <Text color={blocked ? 'red.600' : 'gray.600'} fontSize="sm">
+                        {blocked
+                          ? '该系统任务已阻断，失败回执进入复核，复核前请求不能关闭。'
+                          : '该系统尚未返回回执，全部回执到齐前不能合并结果。'}
+                      </Text>
+                      <Button
+                        mt="2"
+                        size="xs"
+                        colorScheme="brand"
+                        isDisabled={request.identity.status !== 'verified'}
+                        onClick={() => openDialog('receipt', system)}
+                        leftIcon={<Inbox size={13} />}
+                      >
+                        登记回执
+                      </Button>
+                    </Box>
+                  )}
+                </Box>
+              )
+            })}
           </VStack>
           <Alert status="info" mt="4" borderRadius="5px">
-            每个系统分别执行并登记证据，合并结果时不得覆盖原始时间点。
+            回执按“系统 + 回执编号”认定同一笔：超时重发只记录送达，不再生成证据、不推进任务；跨系统回执全部接受后才允许合并。
           </Alert>
         </Box>
       </div>
@@ -552,6 +720,16 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                         {task.exceptionReason}
                       </Text>
                     ) : null}
+                    {task.id.endsWith('-merge') && !receipt.allAccepted && task.status !== 'completed' ? (
+                      <Text mt="1" color="orange.600" fontSize="sm">
+                        跨系统回执 {receipt.acceptedSystemIds.length}/{systems.length}，未到齐不能合并。
+                      </Text>
+                    ) : null}
+                    {task.id.endsWith('-review') && request.conflicts.length > 0 && task.status !== 'completed' ? (
+                      <Text mt="1" color="red.600" fontSize="sm">
+                        尚有 {request.conflicts.length} 项冲突未复核，不能完成复核步骤。
+                      </Text>
+                    ) : null}
                   </Box>
                   <VStack align="flex-end" spacing="2">
                     <Badge
@@ -623,9 +801,27 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
           <VStack align="stretch" spacing="2">
             {request.evidence.map((evidence) => (
               <Box key={evidence.id} className="timeline-item">
-                <Text fontWeight="600">{evidence.name}</Text>
+                <HStack>
+                  <Text fontWeight="600">{evidence.name}</Text>
+                  <Badge
+                    colorScheme={
+                      evidence.source === 'receipt'
+                        ? 'green'
+                        : evidence.source === 'legacy-backfill'
+                          ? 'purple'
+                          : 'gray'
+                    }
+                  >
+                    {evidence.source === 'receipt'
+                      ? '回执接受生成'
+                      : evidence.source === 'legacy-backfill'
+                        ? '旧数据补齐'
+                        : '人工登记'}
+                  </Badge>
+                </HStack>
                 <Text mt="1" color="gray.600" fontSize="xs">
                   {evidence.evidenceType} · {evidence.digest}
+                  {evidence.receiptKey ? <> · <span className="mono">{evidence.receiptKey}</span></> : null}
                 </Text>
                 <Text mt="1" color="gray.500" fontSize="xs">
                   {evidence.uploadedBy} · {new Date(evidence.uploadedAt).toLocaleString('zh-CN')}
@@ -660,6 +856,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                 try {
                   await addComment.mutateAsync({
                     requestId,
+                    expectedVersion: request.version,
                     content: content.trim(),
                     operator: '隐私运营',
                   })
@@ -738,56 +935,65 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                 </FormControl>
                 <Flex gap="4">
                   <FormControl>
-                    <FormLabel>地区</FormLabel>
-                    <Select
-                      value={editForm.region}
-                      onChange={(event) =>
-                        setEditForm({ ...editForm, region: event.target.value as Region })
-                      }
-                    >
-                      {Object.entries(regionLabels).map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </Select>
+                    <FormLabel>地区（登记时冻结，不可改）</FormLabel>
+                    <Input value={regionLabels[editForm.region]} isReadOnly bg="gray.50" />
                   </FormControl>
                   <FormControl>
-                    <FormLabel>请求类型</FormLabel>
-                    <Select
-                      value={editForm.type}
-                      onChange={(event) =>
-                        setEditForm({ ...editForm, type: event.target.value as RequestType })
-                      }
-                    >
-                      {Object.entries(requestTypeLabels).map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </Select>
+                    <FormLabel>请求类型（登记时冻结，不可改）</FormLabel>
+                    <Input value={requestTypeLabels[editForm.type]} isReadOnly bg="gray.50" />
                   </FormControl>
                 </Flex>
                 <FormControl>
-                  <FormLabel>相关系统</FormLabel>
+                  <FormLabel>相关系统（登记时冻结，不可改）</FormLabel>
                   <HStack wrap="wrap">
-                    {data.systems.map((system) => (
-                      <Checkbox
-                        key={system.id}
-                        isChecked={editForm.affectedSystemIds.includes(system.id)}
-                        onChange={(event) =>
-                          setEditForm({
-                            ...editForm,
-                            affectedSystemIds: event.target.checked
-                              ? [...editForm.affectedSystemIds, system.id]
-                              : editForm.affectedSystemIds.filter((id) => id !== system.id),
-                          })
-                        }
-                      >
-                        {system.name}
-                      </Checkbox>
-                    ))}
+                    {data.systems
+                      .filter((system) => editForm.affectedSystemIds.includes(system.id))
+                      .map((system) => (
+                        <Badge key={system.id} colorScheme="blue" fontSize="sm">
+                          {system.name}
+                        </Badge>
+                      ))}
                   </HStack>
+                </FormControl>
+                <Alert status="info" borderRadius="5px">
+                  期限按登记时地区模板冻结（{request.deadlineTemplate.templateVersion}，
+                  {request.deadlineTemplate.days} 日）；新模板只影响之后登记的请求。如需变更地区、类型或系统范围，请重新登记请求。
+                </Alert>
+              </VStack>
+            ) : null}
+
+            {dialog === 'receipt' && selectedSystem ? (
+              <VStack align="stretch" spacing="4">
+                <Alert status="info" borderRadius="5px">
+                  {selectedSystem.name}：回执编号是幂等键。超时重发请保持同一编号，系统按同一笔确认，不会重复生成证据。
+                </Alert>
+                <FormControl isRequired>
+                  <FormLabel>系统回执编号（幂等键）</FormLabel>
+                  <Input
+                    value={receiptKey}
+                    onChange={(event) => setReceiptKey(event.target.value)}
+                    placeholder="例如 RCP-CRM-0929-201"
+                  />
+                </FormControl>
+                <FormControl>
+                  <FormLabel>回执结果</FormLabel>
+                  <Select
+                    value={receiptResult}
+                    onChange={(event) =>
+                      setReceiptResult(event.target.value as 'accepted' | 'failed')
+                    }
+                  >
+                    <option value="accepted">处理完成（接受，生成回执证据并推进任务）</option>
+                    <option value="failed">处理失败/例外（进入冲突复核，不允许关闭）</option>
+                  </Select>
+                </FormControl>
+                <FormControl isRequired>
+                  <FormLabel>处理结果说明</FormLabel>
+                  <Textarea
+                    value={content}
+                    onChange={(event) => setContent(event.target.value)}
+                    placeholder="说明该系统的实际处理结果、数据范围或失败原因"
+                  />
                 </FormControl>
               </VStack>
             ) : null}

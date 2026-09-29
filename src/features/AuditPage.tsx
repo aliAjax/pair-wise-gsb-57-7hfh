@@ -68,7 +68,8 @@ export function AuditPage() {
   function sanitizedPackage() {
     return {
       exportedAt: new Date().toISOString(),
-      policy: '用户隐私权利请求履约操作规范 v1',
+      policy: '用户隐私权利请求履约操作规范 v2（版本绑定、回执幂等、模板冻结）',
+      schemaVersion: workspace.schemaVersion,
       summary: {
         requestCount: workspace.requests.length,
         openCount: workspace.requests.filter(
@@ -107,8 +108,22 @@ export function AuditPage() {
           name: evidence.name,
           type: evidence.evidenceType,
           digest: evidence.digest,
+          receiptKey: evidence.receiptKey,
+          source: evidence.source,
           uploadedAt: evidence.uploadedAt,
         })),
+        systemReceipts: request.systemReceipts.map((receipt) => ({
+          system: workspace.systems.find((system) => system.id === receipt.systemId)?.name ?? receipt.systemId,
+          receiptKey: receipt.receiptKey,
+          status: receipt.status === 'accepted' ? '已接受' : '失败待复核',
+          summary: receipt.summary,
+          receivedAt: receipt.receivedAt,
+          lastDeliveryAt: receipt.lastDeliveryAt,
+          deliveryCount: receipt.deliveryCount,
+          redeliveries: receipt.redeliveries,
+        })),
+        version: request.version,
+        deadlineTemplate: request.deadlineTemplate,
         conflicts: request.conflicts,
         resultSummary: request.resultSummary,
         closureReason: request.closureReason,

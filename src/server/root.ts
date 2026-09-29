@@ -8,8 +8,10 @@ import {
   createRequest,
   extendRequest,
   recordExport,
+  registerSystemReceipt,
   resolveConflict,
   saveRequest,
+  StaleVersionError,
   taskAction,
   verifyIdentity,
 } from '@/services/requestService'
@@ -24,6 +26,7 @@ import {
   extendRequestInputSchema,
   identityInputSchema,
   recordExportInputSchema,
+  registerReceiptInputSchema,
   resolveConflictInputSchema,
   saveRequestInputSchema,
   taskActionInputSchema,
@@ -37,6 +40,9 @@ function execute(operation: () => WorkspaceState): WorkspaceState {
   try {
     return operation()
   } catch (error) {
+    if (error instanceof StaleVersionError) {
+      throw new TRPCError({ code: 'CONFLICT', message: error.message })
+    }
     throw new TRPCError({
       code: 'BAD_REQUEST',
       message: error instanceof Error ? error.message : '请求处理失败',
@@ -57,13 +63,28 @@ export const appRouter = t.router({
     save: publicProcedure
       .input(saveRequestInputSchema)
       .mutation(({ input }) =>
-        execute(() => saveRequest(input.state, input.requestId, input.patch, input.operator)),
+        execute(() =>
+          saveRequest(
+            input.state,
+            input.requestId,
+            input.expectedVersion,
+            input.patch,
+            input.operator,
+          ),
+        ),
       ),
     verifyIdentity: publicProcedure
       .input(identityInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          verifyIdentity(input.state, input.requestId, input.status, input.note, input.operator),
+          verifyIdentity(
+            input.state,
+            input.requestId,
+            input.expectedVersion,
+            input.status,
+            input.note,
+            input.operator,
+          ),
         ),
       ),
     assignTask: publicProcedure
@@ -73,6 +94,7 @@ export const appRouter = t.router({
           assignTask(
             input.state,
             input.requestId,
+            input.expectedVersion,
             input.taskId,
             input.assignee,
             input.operator,
@@ -86,6 +108,7 @@ export const appRouter = t.router({
           taskAction(
             input.state,
             input.requestId,
+            input.expectedVersion,
             input.taskId,
             input.action,
             input.note,
@@ -100,9 +123,27 @@ export const appRouter = t.router({
           addEvidence(
             input.state,
             input.requestId,
+            input.expectedVersion,
             input.taskId,
             input.name,
             input.evidenceType,
+            input.operator,
+          ),
+        ),
+      ),
+    registerReceipt: publicProcedure
+      .input(registerReceiptInputSchema)
+      .mutation(({ input }) =>
+        execute(() =>
+          registerSystemReceipt(
+            input.state,
+            input.requestId,
+            input.expectedVersion,
+            input.systemId,
+            input.receiptKey,
+            input.result,
+            input.summary,
+            input.note,
             input.operator,
           ),
         ),
@@ -111,7 +152,13 @@ export const appRouter = t.router({
       .input(conflictInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          addConflict(input.state, input.requestId, input.conflict, input.operator),
+          addConflict(
+            input.state,
+            input.requestId,
+            input.expectedVersion,
+            input.conflict,
+            input.operator,
+          ),
         ),
       ),
     resolveConflict: publicProcedure
@@ -121,6 +168,7 @@ export const appRouter = t.router({
           resolveConflict(
             input.state,
             input.requestId,
+            input.expectedVersion,
             input.conflictIndex,
             input.resolution,
             input.operator,
@@ -134,6 +182,7 @@ export const appRouter = t.router({
           extendRequest(
             input.state,
             input.requestId,
+            input.expectedVersion,
             input.days,
             input.reason,
             input.operator,
@@ -147,6 +196,7 @@ export const appRouter = t.router({
           closeRequest(
             input.state,
             input.requestId,
+            input.expectedVersion,
             input.resultSummary,
             input.closureReason,
             input.operator,
@@ -157,7 +207,13 @@ export const appRouter = t.router({
       .input(commentInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          addComment(input.state, input.requestId, input.content, input.operator),
+          addComment(
+            input.state,
+            input.requestId,
+            input.expectedVersion,
+            input.content,
+            input.operator,
+          ),
         ),
       ),
     recordExport: publicProcedure

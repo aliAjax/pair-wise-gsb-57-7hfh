@@ -1,5 +1,6 @@
-import type { DataSystem, PrivacyRequest, WorkspaceState } from '@/types/domain'
-import { addDays, buildWorkflowSteps } from './workflow'
+import type { DataSystem, PrivacyRequest, SystemReceipt, WorkspaceState } from '@/types/domain'
+import { CURRENT_SCHEMA_VERSION } from '@/lib/schemas'
+import { addDays, buildWorkflowSteps, freezeDeadlineTemplate } from './workflow'
 
 const systems: DataSystem[] = [
   {
@@ -74,6 +75,24 @@ function audit(
   return { id, action, operator, detail, createdAt }
 }
 
+function receipt(input: Omit<SystemReceipt, 'id'>): SystemReceipt {
+  return { id: `receipt-${input.systemId}-${input.receiptKey}`, ...input }
+}
+
+/** 把指定系统的定位/执行任务标为已完成 */
+function completeSystemTasks(request: PrivacyRequest, systemId: string, completedAt: string) {
+  for (const task of request.tasks) {
+    if (
+      task.systemId === systemId &&
+      (task.id.includes('-locate-') || task.id.includes('-execute-'))
+    ) {
+      task.status = 'completed'
+      task.completedAt = completedAt
+      task.exceptionReason = ''
+    }
+  }
+}
+
 export function createInitialState(): WorkspaceState {
   const request1At = '2026-09-25T02:30:00.000Z'
   const request2At = '2026-09-18T06:20:00.000Z'
@@ -86,259 +105,439 @@ export function createInitialState(): WorkspaceState {
   const request4Due = addDays(new Date(request4At), 30).toISOString()
   const request5Due = addDays(new Date(request5At), 30).toISOString()
 
-  const requests: PrivacyRequest[] = [
-    {
-      id: 'req-001',
-      code: 'DSR-2026-001',
-      requesterName: '张晨',
-      requesterContact: 'zh***@example.com',
-      region: 'cn',
-      type: 'access',
-      status: 'processing',
-      identity: {
-        status: 'verified',
-        materialType: 'masked-id',
-        maskedReference: '310***********1234',
-        protectedDigest: 'ID-74A1B2',
-        note: '证件影像已核验，原始文件未进入业务库。',
-        reviewedAt: '2026-09-25T04:10:00.000Z',
-      },
-      requestedAt: request1At,
-      dueAt: request1Due,
-      extendedDays: 0,
-      affectedSystemIds: ['sys-crm', 'sys-order', 'sys-support'],
-      tasks: buildWorkflowSteps({
-        requestId: 'req-001',
-        type: 'access',
-        systemIds: ['sys-crm', 'sys-order', 'sys-support'],
-        requestedAt: request1At,
-        dueAt: request1Due,
-        initialStatus: 'processing',
-        systems,
-      }),
-      evidence: [
-        {
-          id: 'evidence-001-a',
-          stepId: 'req-001-identity',
-          name: '身份核验记录',
-          evidenceType: 'signed-record',
-          digest: '9A11-77D2',
-          uploadedBy: '当前客服',
-          uploadedAt: '2026-09-25T04:10:00.000Z',
-          protected: true,
-        },
-      ],
-      conflicts: [],
-      resultSummary: '',
-      closureReason: '',
-      audit: [
-        audit(
-          'req-audit-001',
-          '登记请求',
-          '客服专员',
-          '访问请求已登记，并生成 30 日流程。',
-          request1At,
-        ),
-      ],
+  // req-001：CRM 回执已接受（经历过一次超时重发），订单与客服系统回执未到
+  const req1CrmReceivedAt = '2026-09-28T07:30:00.000Z'
+  const req1CrmRedeliveredAt = '2026-09-29T01:10:00.000Z'
+  const request1: PrivacyRequest = {
+    id: 'req-001',
+    code: 'DSR-2026-001',
+    version: 4,
+    requesterName: '张晨',
+    requesterContact: 'zh***@example.com',
+    region: 'cn',
+    type: 'access',
+    status: 'processing',
+    identity: {
+      status: 'verified',
+      materialType: 'masked-id',
+      maskedReference: '310***********1234',
+      protectedDigest: 'ID-74A1B2',
+      note: '证件影像已核验，原始文件未进入业务库。',
+      reviewedAt: '2026-09-25T04:10:00.000Z',
     },
-    {
-      id: 'req-002',
-      code: 'DSR-2026-002',
-      requesterName: '王宁',
-      requesterContact: 'wa***@example.com',
-      region: 'eu',
-      type: 'deletion',
-      status: 'review-required',
-      identity: {
-        status: 'insufficient',
-        materialType: 'authorization-letter',
-        maskedReference: '授权书仅含截图',
-        protectedDigest: 'AUTH-11E9',
-        note: '缺少委托关系证明，需进入身份材料复核。',
+    requestedAt: request1At,
+    dueAt: request1Due,
+    deadlineTemplate: freezeDeadlineTemplate('cn', request1At),
+    extendedDays: 0,
+    affectedSystemIds: ['sys-crm', 'sys-order', 'sys-support'],
+    tasks: [],
+    evidence: [
+      {
+        id: 'evidence-001-a',
+        stepId: 'req-001-identity',
+        name: '身份核验记录',
+        evidenceType: 'signed-record',
+        digest: '9A11-77D2',
+        uploadedBy: '当前客服',
+        uploadedAt: '2026-09-25T04:10:00.000Z',
+        protected: true,
+        source: 'manual',
       },
+      {
+        id: 'evidence-001-b',
+        stepId: 'req-001-execute-sys-crm',
+        name: '客户关系管理系统处理回执（RCP-CRM-0928-119）',
+        evidenceType: 'system-response',
+        digest: 'PD-3F82A10C',
+        uploadedBy: '客户平台组',
+        uploadedAt: req1CrmReceivedAt,
+        protected: true,
+        receiptKey: 'RCP-CRM-0928-119',
+        source: 'receipt',
+      },
+    ],
+    systemReceipts: [
+      receipt({
+        systemId: 'sys-crm',
+        receiptKey: 'RCP-CRM-0928-119',
+        status: 'accepted',
+        summary: '客户主档、服务记录访问包已生成并加密传输。',
+        receivedAt: req1CrmReceivedAt,
+        lastDeliveryAt: req1CrmRedeliveredAt,
+        deliveryCount: 2,
+        operator: '客户平台组',
+        redeliveries: [
+          {
+            deliveredAt: req1CrmRedeliveredAt,
+            operator: '系统自动重发',
+            note: '回执超时未确认自动重发，与首次为同一笔，仅更新送达状态。',
+          },
+        ],
+      }),
+    ],
+    conflicts: [],
+    resultSummary: '',
+    closureReason: '',
+    audit: [
+      audit(
+        'req-audit-001-redelivery',
+        '系统回执重发（按同一笔确认）',
+        '系统自动重发',
+        '客户关系管理系统回执 RCP-CRM-0928-119 第 2 次送达，按同一笔确认，未重复生成证据。',
+        req1CrmRedeliveredAt,
+      ),
+      audit(
+        'req-audit-001-receipt',
+        '接受系统处理回执',
+        '客户平台组',
+        '接受客户关系管理系统回执 RCP-CRM-0928-119；回执到齐 1/3，等待 2 个系统。',
+        req1CrmReceivedAt,
+      ),
+      audit(
+        'req-audit-001',
+        '登记请求',
+        '客服专员',
+        '访问请求已登记，按 2026-v1 版中国大陆 30 日模板冻结期限。',
+        request1At,
+      ),
+    ],
+  }
+  request1.tasks = buildWorkflowSteps({
+    requestId: 'req-001',
+    type: 'access',
+    systemIds: ['sys-crm', 'sys-order', 'sys-support'],
+    requestedAt: request1At,
+    dueAt: request1Due,
+    initialStatus: 'processing',
+    systems,
+  })
+  completeSystemTasks(request1, 'sys-crm', req1CrmReceivedAt)
+  const locateOrder = request1.tasks.find((task) => task.id === 'req-001-locate-sys-order')
+  if (locateOrder) locateOrder.status = 'active'
+
+  const request2: PrivacyRequest = {
+    id: 'req-002',
+    code: 'DSR-2026-002',
+    version: 2,
+    requesterName: '王宁',
+    requesterContact: 'wa***@example.com',
+    region: 'eu',
+    type: 'deletion',
+    status: 'review-required',
+    identity: {
+      status: 'insufficient',
+      materialType: 'authorization-letter',
+      maskedReference: '授权书仅含截图',
+      protectedDigest: 'AUTH-11E9',
+      note: '缺少委托关系证明，需进入身份材料复核。',
+    },
+    requestedAt: request2At,
+    dueAt: request2Due,
+    deadlineTemplate: freezeDeadlineTemplate('eu', request2At),
+    extendedDays: 0,
+    duplicateOf: 'req-005',
+    affectedSystemIds: ['sys-crm', 'sys-marketing', 'sys-support'],
+    tasks: buildWorkflowSteps({
+      requestId: 'req-002',
+      type: 'deletion',
+      systemIds: ['sys-crm', 'sys-marketing', 'sys-support'],
       requestedAt: request2At,
       dueAt: request2Due,
-      extendedDays: 0,
-      duplicateOf: 'req-005',
-      affectedSystemIds: ['sys-crm', 'sys-marketing', 'sys-support'],
-      tasks: buildWorkflowSteps({
-        requestId: 'req-002',
-        type: 'deletion',
-        systemIds: ['sys-crm', 'sys-marketing', 'sys-support'],
-        requestedAt: request2At,
-        dueAt: request2Due,
-        initialStatus: 'review-required',
-        systems,
+      initialStatus: 'review-required',
+      systems,
+    }),
+    evidence: [],
+    systemReceipts: [],
+    conflicts: [
+      '身份材料不足：授权书无法证明申请人与数据主体关系。',
+      '疑似重复请求：与 DSR-2026-005 的请求人和处理类型相同。',
+    ],
+    resultSummary: '',
+    closureReason: '',
+    audit: [
+      audit(
+        'req-audit-002',
+        '转入复核队列',
+        '隐私运营',
+        '身份材料不足且检测到疑似重复请求。',
+        '2026-09-19T02:00:00.000Z',
+      ),
+    ],
+  }
+
+  const req3CrmAt = '2026-09-28T06:00:00.000Z'
+  const req3RiskAt = '2026-09-28T08:30:00.000Z'
+  const request3: PrivacyRequest = {
+    id: 'req-003',
+    code: 'DSR-2026-003',
+    version: 4,
+    requesterName: '刘晓',
+    requesterContact: 'li***@example.com',
+    region: 'us',
+    type: 'rectification',
+    status: 'review-required',
+    identity: {
+      status: 'verified',
+      materialType: 'account-ownership',
+      maskedReference: '账号所有权验证通过',
+      protectedDigest: 'ACC-559A',
+      note: '依据登录挑战与近期交易完成核验。',
+      reviewedAt: '2026-09-21T05:30:00.000Z',
+    },
+    requestedAt: request3At,
+    dueAt: request3Due,
+    deadlineTemplate: freezeDeadlineTemplate('us', request3At),
+    extendedDays: 0,
+    affectedSystemIds: ['sys-crm', 'sys-risk', 'sys-support'],
+    tasks: [],
+    evidence: [
+      {
+        id: 'evidence-003-a',
+        stepId: 'req-003-execute-sys-crm',
+        name: '客户关系管理系统处理回执（RCP-CRM-0928-055）',
+        evidenceType: 'system-response',
+        digest: 'PD-A014C77E',
+        uploadedBy: '客户平台组',
+        uploadedAt: req3CrmAt,
+        protected: true,
+        receiptKey: 'RCP-CRM-0928-055',
+        source: 'receipt',
+      },
+    ],
+    systemReceipts: [
+      receipt({
+        systemId: 'sys-crm',
+        receiptKey: 'RCP-CRM-0928-055',
+        status: 'accepted',
+        summary: '客户系统中的姓名已更正完成。',
+        receivedAt: req3CrmAt,
+        lastDeliveryAt: req3CrmAt,
+        deliveryCount: 1,
+        operator: '客户平台组',
+        redeliveries: [],
       }),
-      evidence: [],
-      conflicts: [
-        '身份材料不足：授权书无法证明申请人与数据主体关系。',
-        '疑似重复请求：与 DSR-2026-005 的请求人和处理类型相同。',
-      ],
-      resultSummary: '',
-      closureReason: '',
-      audit: [
-        audit(
-          'req-audit-002',
-          '转入复核队列',
-          '隐私运营',
-          '身份材料不足且检测到疑似重复请求。',
-          '2026-09-19T02:00:00.000Z',
-        ),
-      ],
+      receipt({
+        systemId: 'sys-risk',
+        receiptKey: 'RCP-RISK-0928-008',
+        status: 'failed',
+        summary: '风控平台拒绝更新风险标签关联姓名，返回值与客户系统不一致。',
+        receivedAt: req3RiskAt,
+        lastDeliveryAt: req3RiskAt,
+        deliveryCount: 1,
+        operator: '风险技术组',
+        redeliveries: [],
+        conflict: '系统回执例外：风控决策平台回执 RCP-RISK-0928-008 返回失败——风控平台拒绝更新风险标签关联姓名，返回值与客户系统不一致。',
+      }),
+    ],
+    conflicts: [
+      '系统回执例外：风控决策平台回执 RCP-RISK-0928-008 返回失败——风控平台拒绝更新风险标签关联姓名，返回值与客户系统不一致。',
+    ],
+    resultSummary: '',
+    closureReason: '',
+    audit: [
+      audit(
+        'req-audit-003-risk',
+        '系统回执失败进入复核',
+        '风险技术组',
+        '风控决策平台回执 RCP-RISK-0928-008 返回失败，冲突未复核前不能关闭。',
+        req3RiskAt,
+      ),
+      audit(
+        'req-audit-003-crm',
+        '接受系统处理回执',
+        '客户平台组',
+        '接受客户关系管理系统回执 RCP-CRM-0928-055；回执到齐 1/3，等待 2 个系统。',
+        req3CrmAt,
+      ),
+    ],
+  }
+  request3.tasks = buildWorkflowSteps({
+    requestId: 'req-003',
+    type: 'rectification',
+    systemIds: ['sys-crm', 'sys-risk', 'sys-support'],
+    requestedAt: request3At,
+    dueAt: request3Due,
+    initialStatus: 'processing',
+    systems,
+  })
+  completeSystemTasks(request3, 'sys-crm', req3CrmAt)
+  const executeRisk = request3.tasks.find((task) => task.id === 'req-003-execute-sys-risk')
+  if (executeRisk) {
+    executeRisk.status = 'blocked'
+    executeRisk.exceptionReason = '风控平台返回值与客服系统不一致。'
+  }
+
+  const req4ReceiptAt = '2026-09-28T09:00:00.000Z'
+  const request4: PrivacyRequest = {
+    id: 'req-004',
+    code: 'DSR-2026-004',
+    version: 4,
+    requesterName: '陈妙',
+    requesterContact: 'ch***@example.com',
+    region: 'sg',
+    type: 'withdraw-consent',
+    status: 'pending-close',
+    identity: {
+      status: 'verified',
+      materialType: 'account-ownership',
+      maskedReference: '账号所有权验证通过',
+      protectedDigest: 'ACC-880D',
+      note: '账号双因素验证通过。',
+      reviewedAt: '2026-09-24T07:00:00.000Z',
     },
-    {
-      id: 'req-003',
-      code: 'DSR-2026-003',
-      requesterName: '刘晓',
-      requesterContact: 'li***@example.com',
-      region: 'us',
-      type: 'rectification',
-      status: 'review-required',
-      identity: {
-        status: 'verified',
-        materialType: 'account-ownership',
-        maskedReference: '账号所有权验证通过',
-        protectedDigest: 'ACC-559A',
-        note: '依据登录挑战与近期交易完成核验。',
-        reviewedAt: '2026-09-21T05:30:00.000Z',
-      },
-      requestedAt: request3At,
-      dueAt: request3Due,
-      extendedDays: 0,
-      affectedSystemIds: ['sys-crm', 'sys-risk', 'sys-support'],
-      tasks: buildWorkflowSteps({
-        requestId: 'req-003',
-        type: 'rectification',
-        systemIds: ['sys-crm', 'sys-risk', 'sys-support'],
-        requestedAt: request3At,
-        dueAt: request3Due,
-        initialStatus: 'processing',
-        systems,
-      }).map((step, index) => (index === 1 ? { ...step, status: 'blocked', exceptionReason: '风控平台返回值与客服系统不一致。' } : step)),
-      evidence: [],
-      conflicts: ['跨系统结果冲突：客户系统中的姓名已更正，但风控平台仍保留旧值。'],
-      resultSummary: '',
-      closureReason: '',
-      audit: [
-        audit(
-          'req-audit-003',
-          '发现跨系统冲突',
-          '数据管理员',
-          '风控平台拒绝更新风险标签关联姓名。',
-          '2026-09-28T08:30:00.000Z',
-        ),
-      ],
-    },
-    {
-      id: 'req-004',
-      code: 'DSR-2026-004',
-      requesterName: '陈妙',
-      requesterContact: 'ch***@example.com',
-      region: 'sg',
+    requestedAt: request4At,
+    dueAt: request4Due,
+    deadlineTemplate: freezeDeadlineTemplate('sg', request4At),
+    extendedDays: 0,
+    affectedSystemIds: ['sys-marketing'],
+    tasks: buildWorkflowSteps({
+      requestId: 'req-004',
       type: 'withdraw-consent',
-      status: 'pending-close',
-      identity: {
-        status: 'verified',
-        materialType: 'account-ownership',
-        maskedReference: '账号所有权验证通过',
-        protectedDigest: 'ACC-880D',
-        note: '账号双因素验证通过。',
-        reviewedAt: '2026-09-24T07:00:00.000Z',
-      },
+      systemIds: ['sys-marketing'],
       requestedAt: request4At,
       dueAt: request4Due,
-      extendedDays: 0,
-      affectedSystemIds: ['sys-marketing'],
-      tasks: buildWorkflowSteps({
-        requestId: 'req-004',
-        type: 'withdraw-consent',
-        systemIds: ['sys-marketing'],
-        requestedAt: request4At,
-        dueAt: request4Due,
-        initialStatus: 'pending-close',
-        systems,
-      }),
-      evidence: [
-        {
-          id: 'evidence-004-a',
-          stepId: 'req-004-execute-sys-marketing',
-          name: '同意状态变更日志',
-          evidenceType: 'execution-log',
-          digest: 'E31A-880D',
-          uploadedBy: '增长技术组',
-          uploadedAt: '2026-09-28T09:00:00.000Z',
-          protected: true,
-        },
-      ],
-      conflicts: [],
-      resultSummary: '营销平台已撤回同意并停止后续自动化触达。',
-      closureReason: '',
-      audit: [
-        audit(
-          'req-audit-004',
-          '待关闭复核',
-          '隐私运营',
-          '全部系统任务已完成，等待负责人确认结果。',
-          '2026-09-28T09:10:00.000Z',
-        ),
-      ],
-    },
-    {
-      id: 'req-005',
-      code: 'DSR-2026-005',
-      requesterName: '王宁',
-      requesterContact: 'wa***@example.com',
-      region: 'eu',
-      type: 'deletion',
-      status: 'completed',
-      identity: {
-        status: 'verified',
-        materialType: 'masked-id',
-        maskedReference: '310***********8832',
-        protectedDigest: 'ID-771B',
-        note: '身份核验已完成。',
-        reviewedAt: '2026-09-05T03:30:00.000Z',
+      initialStatus: 'pending-close',
+      systems,
+    }),
+    evidence: [
+      {
+        id: 'evidence-004-a',
+        stepId: 'req-004-execute-sys-marketing',
+        name: '同意状态变更日志（RCP-MKT-0928-031）',
+        evidenceType: 'execution-log',
+        digest: 'E31A-880D',
+        uploadedBy: '增长技术组',
+        uploadedAt: req4ReceiptAt,
+        protected: true,
+        receiptKey: 'RCP-MKT-0928-031',
+        source: 'receipt',
       },
+    ],
+    systemReceipts: [
+      receipt({
+        systemId: 'sys-marketing',
+        receiptKey: 'RCP-MKT-0928-031',
+        status: 'accepted',
+        summary: '已撤回同意并停止后续自动化触达。',
+        receivedAt: req4ReceiptAt,
+        lastDeliveryAt: req4ReceiptAt,
+        deliveryCount: 1,
+        operator: '增长技术组',
+        redeliveries: [],
+      }),
+    ],
+    conflicts: [],
+    resultSummary: '营销平台已撤回同意并停止后续自动化触达。',
+    closureReason: '',
+    audit: [
+      audit(
+        'req-audit-004',
+        '待关闭复核',
+        '隐私运营',
+        '全部系统回执已到齐并合并结果，等待负责人确认关闭。',
+        '2026-09-28T09:10:00.000Z',
+      ),
+    ],
+  }
+
+  const req5CrmAt = '2026-09-08T05:00:00.000Z'
+  const req5MktAt = '2026-09-08T06:30:00.000Z'
+  const request5: PrivacyRequest = {
+    id: 'req-005',
+    code: 'DSR-2026-005',
+    version: 9,
+    requesterName: '王宁',
+    requesterContact: 'wa***@example.com',
+    region: 'eu',
+    type: 'deletion',
+    status: 'completed',
+    identity: {
+      status: 'verified',
+      materialType: 'masked-id',
+      maskedReference: '310***********8832',
+      protectedDigest: 'ID-771B',
+      note: '身份核验已完成。',
+      reviewedAt: '2026-09-05T03:30:00.000Z',
+    },
+    requestedAt: request5At,
+    dueAt: request5Due,
+    deadlineTemplate: freezeDeadlineTemplate('eu', request5At),
+    extendedDays: 0,
+    affectedSystemIds: ['sys-crm', 'sys-marketing'],
+    tasks: buildWorkflowSteps({
+      requestId: 'req-005',
+      type: 'deletion',
+      systemIds: ['sys-crm', 'sys-marketing'],
       requestedAt: request5At,
       dueAt: request5Due,
-      extendedDays: 0,
-      affectedSystemIds: ['sys-crm', 'sys-marketing'],
-      tasks: buildWorkflowSteps({
-        requestId: 'req-005',
-        type: 'deletion',
-        systemIds: ['sys-crm', 'sys-marketing'],
-        requestedAt: request5At,
-        dueAt: request5Due,
-        initialStatus: 'completed',
-        systems,
+      initialStatus: 'completed',
+      systems,
+    }),
+    evidence: [
+      {
+        id: 'evidence-005-a',
+        stepId: 'req-005-execute-sys-crm',
+        name: '删除执行回执（RCP-CRM-0908-077）',
+        evidenceType: 'system-response',
+        digest: 'E5A0-1201',
+        uploadedBy: '客户平台组',
+        uploadedAt: req5CrmAt,
+        protected: true,
+        receiptKey: 'RCP-CRM-0908-077',
+        source: 'receipt',
+      },
+      {
+        id: 'evidence-005-b',
+        stepId: 'req-005-execute-sys-marketing',
+        name: '同意与触达删除回执（RCP-MKT-0908-014）',
+        evidenceType: 'system-response',
+        digest: 'PD-7B209EE1',
+        uploadedBy: '增长技术组',
+        uploadedAt: req5MktAt,
+        protected: true,
+        receiptKey: 'RCP-MKT-0908-014',
+        source: 'receipt',
+      },
+    ],
+    systemReceipts: [
+      receipt({
+        systemId: 'sys-crm',
+        receiptKey: 'RCP-CRM-0908-077',
+        status: 'accepted',
+        summary: '客户主档删除完成，保留最小合规凭证。',
+        receivedAt: req5CrmAt,
+        lastDeliveryAt: req5CrmAt,
+        deliveryCount: 1,
+        operator: '客户平台组',
+        redeliveries: [],
       }),
-      evidence: [
-        {
-          id: 'evidence-005-a',
-          stepId: 'req-005-execute-sys-crm',
-          name: '删除执行回执',
-          evidenceType: 'system-response',
-          digest: 'E5A0-1201',
-          uploadedBy: '客户平台组',
-          uploadedAt: '2026-09-08T05:00:00.000Z',
-          protected: true,
-        },
-      ],
-      conflicts: [],
-      resultSummary: '已完成请求主体在两个系统中的删除，并保留最小合规凭证。',
-      closureReason: '期限已到且任务完整，经复核后关闭。',
-      audit: [
-        audit(
-          'req-audit-005',
-          '完成请求',
-          '隐私负责人',
-          '处理结果合并完成并生成操作审计。',
-          '2026-09-10T02:00:00.000Z',
-        ),
-      ],
-    },
-  ]
+      receipt({
+        systemId: 'sys-marketing',
+        receiptKey: 'RCP-MKT-0908-014',
+        status: 'accepted',
+        summary: '同意记录与触达标签已删除。',
+        receivedAt: req5MktAt,
+        lastDeliveryAt: req5MktAt,
+        deliveryCount: 1,
+        operator: '增长技术组',
+        redeliveries: [],
+      }),
+    ],
+    conflicts: [],
+    resultSummary: '已完成请求主体在两个系统中的删除，并保留最小合规凭证。',
+    closureReason: '期限已到且任务完整，经复核后关闭。',
+    audit: [
+      audit(
+        'req-audit-005',
+        '完成请求',
+        '隐私负责人',
+        '全部系统回执到齐，处理结果合并完成并生成操作审计。',
+        '2026-09-10T02:00:00.000Z',
+      ),
+    ],
+  }
+
+  const requests: PrivacyRequest[] = [request1, request2, request3, request4, request5]
 
   return {
     requests,
@@ -363,10 +562,18 @@ export function createInitialState(): WorkspaceState {
       {
         id: 'audit-global-1',
         requestId: 'req-001',
-        action: '登记请求',
-        operator: '客服专员',
-        detail: '访问请求进入 30 日履约流程。',
-        createdAt: request1At,
+        action: '系统回执重发（按同一笔确认）',
+        operator: '系统自动重发',
+        detail: '客户关系管理系统回执 RCP-CRM-0928-119 第 2 次送达，按同一笔确认，未重复生成证据。',
+        createdAt: req1CrmRedeliveredAt,
+      },
+      {
+        id: 'audit-global-4',
+        requestId: 'req-003',
+        action: '系统回执失败进入复核',
+        operator: '风险技术组',
+        detail: '风控决策平台回执 RCP-RISK-0928-008 返回失败，冲突未复核前不能关闭。',
+        createdAt: req3RiskAt,
       },
       {
         id: 'audit-global-2',
@@ -378,14 +585,15 @@ export function createInitialState(): WorkspaceState {
       },
       {
         id: 'audit-global-3',
-        requestId: 'req-003',
-        action: '跨系统结果冲突',
-        operator: '数据管理员',
-        detail: '风控平台与客户系统结果不一致，进入复核队列。',
-        createdAt: '2026-09-28T08:30:00.000Z',
+        requestId: 'req-001',
+        action: '登记请求',
+        operator: '客服专员',
+        detail: '访问请求进入 30 日履约流程，期限模板已冻结。',
+        createdAt: request1At,
       },
     ],
-    revision: 1,
+    revision: 2,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
   }
 }
 

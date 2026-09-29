@@ -96,6 +96,7 @@ export function ReviewPage() {
       if (action === 'identity-pass') {
         await verifyIdentity.mutateAsync({
           requestId: selected.id,
+          expectedVersion: selected.version,
           status: 'verified',
           note: content || '补充材料经人工核验通过。',
           operator: '隐私负责人',
@@ -103,6 +104,7 @@ export function ReviewPage() {
       } else if (action === 'identity-return') {
         await verifyIdentity.mutateAsync({
           requestId: selected.id,
+          expectedVersion: selected.version,
           status: 'insufficient',
           note: content,
           operator: '隐私负责人',
@@ -110,6 +112,7 @@ export function ReviewPage() {
       } else if (action === 'resolve') {
         await resolveConflict.mutateAsync({
           requestId: selected.id,
+          expectedVersion: selected.version,
           conflictIndex,
           resolution: content,
           operator: '隐私负责人',
@@ -117,6 +120,7 @@ export function ReviewPage() {
       } else {
         await extendRequest.mutateAsync({
           requestId: selected.id,
+          expectedVersion: selected.version,
           days,
           reason: content,
           operator: '隐私负责人',
