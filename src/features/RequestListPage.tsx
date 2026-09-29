@@ -211,8 +211,21 @@ export function RequestListPage() {
                         {request.identity.status === 'insufficient' ? (
                           <Badge colorScheme="red">身份不足</Badge>
                         ) : null}
-                        {request.conflicts.length ? (
-                          <Badge colorScheme="red">{request.conflicts.length} 项冲突</Badge>
+                        {(() => {
+                          const unresolved = request.conflicts.filter(
+                            (conflict) => !conflict.resolved,
+                          ).length
+                          return unresolved ? (
+                            <Badge colorScheme="red">{unresolved} 项冲突</Badge>
+                          ) : null
+                        })()}
+                        {request.receipts && request.receipts.length ? (
+                          <Badge colorScheme="teal">
+                            回执 {
+                              request.receipts.filter((receipt) => receipt.status === 'accepted').length
+                            }
+                            /{request.affectedSystemIds.length}
+                          </Badge>
                         ) : null}
                       </HStack>
                     </Td>
@@ -350,7 +363,7 @@ export function RequestListPage() {
             </FormControl>
 
             <Alert status="success" mt="4" borderRadius="5px">
-              将生成：{templateName(form.region, form.type)}
+              将按当前模板登记并冻结：{templateName(form.region, form.type)}；之后模板改版只影响新登记请求。
             </Alert>
           </ModalBody>
           <ModalFooter>

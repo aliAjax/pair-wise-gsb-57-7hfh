@@ -42,6 +42,7 @@ import {
   useResolveConflictMutation,
   useVerifyIdentityMutation,
   useWorkspaceQuery,
+  isVersionConflictError,
 } from '@/lib/hooks'
 import { deadlineState } from '@/services/workflow'
 
@@ -57,7 +58,7 @@ export function ReviewPage() {
   const [action, setAction] = useState<'identity-pass' | 'identity-return' | 'resolve' | 'extend'>(
     'identity-pass',
   )
-  const [conflictIndex, setConflictIndex] = useState(0)
+  const [conflictId, setConflictId] = useState('')
   const [content, setContent] = useState('')
   const [days, setDays] = useState(15)
 
@@ -68,7 +69,7 @@ export function ReviewPage() {
           request.status === 'review-required' ||
           request.identity.status === 'insufficient' ||
           request.duplicateOf ||
-          request.conflicts.length > 0 ||
+          request.conflicts.some((conflict) => !conflict.resolved) ||
           new Date(request.dueAt).getTime() < Date.now(),
       ) ?? [],
     [data],
@@ -81,11 +82,11 @@ export function ReviewPage() {
   function openAction(
     requestId: string,
     nextAction: 'identity-pass' | 'identity-return' | 'resolve' | 'extend',
-    index = 0,
+    id = '',
   ) {
     setSelectedId(requestId)
     setAction(nextAction)
-    setConflictIndex(index)
+    setConflictId(id)
     setContent('')
     onOpen()
   }
@@ -110,7 +111,7 @@ export function ReviewPage() {
       } else if (action === 'resolve') {
         await resolveConflict.mutateAsync({
           requestId: selected.id,
-          conflictIndex,
+          conflictId,
           resolution: content,
           operator: '隐私负责人',
         })
@@ -126,8 +127,12 @@ export function ReviewPage() {
       onClose()
     } catch (error) {
       toast({
-        title: '复核操作失败',
-        description: error instanceof Error ? error.message : '请检查输入',
+        title: isVersionConflictError(error) ? '操作基于过期版本，已被拒绝' : '复核操作失败',
+        description: isVersionConflictError(error)
+          ? '另一个页面已先保存结果，请刷新核对后重试。'
+          : error instanceof Error
+            ? error.message
+            : '请检查输入',
         status: 'error',
       })
     }
@@ -163,10 +168,14 @@ export function ReviewPage() {
         </Box>
         <Box className="metric danger">
           <Text color="gray.600" fontSize="sm">
-            结果冲突
+            待复核冲突
           </Text>
           <Heading mt="2" size="md">
-            {queue.reduce((total, request) => total + request.conflicts.length, 0)}
+            {queue.reduce(
+              (total, request) =>
+                total + request.conflicts.filter((conflict) => !conflict.resolved).length,
+              0,
+            )}
           </Heading>
         </Box>
         <Box className="metric info">
@@ -211,11 +220,30 @@ export function ReviewPage() {
                         {request.duplicateOf ? (
                           <Badge colorScheme="orange">疑似重复 {request.duplicateOf}</Badge>
                         ) : null}
-                        {request.conflicts.map((conflict, index) => (
-                          <Text key={`${conflict}-${index}`} fontSize="sm">
-                            {conflict}
-                          </Text>
+                        {request.conflicts.map((conflict) => (
+                          <HStack key={conflict.id} spacing="2" align="flex-start">
+                            <Badge
+                              mt="2px"
+                              flexShrink={0}
+                              colorScheme={conflict.resolved ? 'green' : 'red'}
+                            >
+                              {conflict.resolved ? '已复核' : '待复核'}
+                            </Badge>
+                            <Text
+                              fontSize="sm"
+                              color={conflict.resolved ? 'gray.500' : undefined}
+                            >
+                              {conflict.description}
+                            </Text>
+                          </HStack>
                         ))}
+                        {!request.conflicts.length && !request.duplicateOf ? (
+                          <Text fontSize="sm" color="gray.500">
+                            {new Date(request.dueAt).getTime() < Date.now()
+                              ? '请求已逾期，需延期或尽快处理'
+                              : '身份核验待处理'}
+                          </Text>
+                        ) : null}
                       </VStack>
                     </Td>
                     <Td>
@@ -253,14 +281,22 @@ export function ReviewPage() {
                             通过身份
                           </Button>
                         ) : null}
-                        {request.conflicts.length ? (
+                        {request.conflicts.some((conflict) => !conflict.resolved) ? (
                           <Button
                             size="xs"
                             variant="link"
                             colorScheme="red"
-                            onClick={() => openAction(request.id, 'resolve', 0)}
+                            onClick={() =>
+                              openAction(
+                                request.id,
+                                'resolve',
+                                request.conflicts.find((conflict) => !conflict.resolved)?.id,
+                              )
+                            }
                           >
-                            处理冲突
+                            处理冲突（
+                            {request.conflicts.filter((conflict) => !conflict.resolved).length} 待复核
+                            ）
                           </Button>
                         ) : null}
                         <Button
@@ -288,9 +324,10 @@ export function ReviewPage() {
           <ModalCloseButton />
           <ModalBody>
             <VStack align="stretch" spacing="4">
-              {action === 'resolve' && selected?.conflicts[conflictIndex] ? (
+              {action === 'resolve' &&
+              selected?.conflicts.find((conflict) => conflict.id === conflictId) ? (
                 <Alert status="warning" borderRadius="5px">
-                  {selected.conflicts[conflictIndex]}
+                  {selected.conflicts.find((conflict) => conflict.id === conflictId)?.description}
                 </Alert>
               ) : null}
               {action === 'extend' ? (

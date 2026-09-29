@@ -7,11 +7,14 @@ import {
   closeRequest,
   createRequest,
   extendRequest,
+  mergeResults,
   recordExport,
+  registerReceipt,
   resolveConflict,
   saveRequest,
   taskAction,
   verifyIdentity,
+  VersionConflictError,
 } from '@/services/requestService'
 import { createInitialState } from '@/services/mockData'
 import {
@@ -23,6 +26,8 @@ import {
   evidenceInputSchema,
   extendRequestInputSchema,
   identityInputSchema,
+  mergeInputSchema,
+  receiptInputSchema,
   recordExportInputSchema,
   resolveConflictInputSchema,
   saveRequestInputSchema,
@@ -33,10 +38,16 @@ import type { WorkspaceState } from '@/types/domain'
 const t = initTRPC.create()
 const publicProcedure = t.procedure
 
-function execute(operation: () => WorkspaceState): WorkspaceState {
+function execute<T>(operation: () => T): T {
   try {
     return operation()
   } catch (error) {
+    if (error instanceof VersionConflictError) {
+      throw new TRPCError({
+        code: 'CONFLICT',
+        message: error.message,
+      })
+    }
     throw new TRPCError({
       code: 'BAD_REQUEST',
       message: error instanceof Error ? error.message : '请求处理失败',
@@ -52,18 +63,35 @@ export const appRouter = t.router({
     create: publicProcedure
       .input(createRequestInputSchema)
       .mutation(({ input }) =>
-        execute(() => createRequest(input.state, input.input, input.operator)),
+        execute(() =>
+          createRequest(input.state, input.input, input.operator, input.expectedRevision),
+        ),
       ),
     save: publicProcedure
       .input(saveRequestInputSchema)
       .mutation(({ input }) =>
-        execute(() => saveRequest(input.state, input.requestId, input.patch, input.operator)),
+        execute(() =>
+          saveRequest(
+            input.state,
+            input.expectedRevision,
+            input.requestId,
+            input.patch,
+            input.operator,
+          ),
+        ),
       ),
     verifyIdentity: publicProcedure
       .input(identityInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          verifyIdentity(input.state, input.requestId, input.status, input.note, input.operator),
+          verifyIdentity(
+            input.state,
+            input.expectedRevision,
+            input.requestId,
+            input.status,
+            input.note,
+            input.operator,
+          ),
         ),
       ),
     assignTask: publicProcedure
@@ -72,6 +100,7 @@ export const appRouter = t.router({
         execute(() =>
           assignTask(
             input.state,
+            input.expectedRevision,
             input.requestId,
             input.taskId,
             input.assignee,
@@ -85,6 +114,7 @@ export const appRouter = t.router({
         execute(() =>
           taskAction(
             input.state,
+            input.expectedRevision,
             input.requestId,
             input.taskId,
             input.action,
@@ -99,6 +129,7 @@ export const appRouter = t.router({
         execute(() =>
           addEvidence(
             input.state,
+            input.expectedRevision,
             input.requestId,
             input.taskId,
             input.name,
@@ -107,11 +138,50 @@ export const appRouter = t.router({
           ),
         ),
       ),
+    registerReceipt: publicProcedure
+      .input(receiptInputSchema)
+      .mutation(({ input }) =>
+        execute(() =>
+          registerReceipt(
+            input.state,
+            input.expectedRevision,
+            input.requestId,
+            {
+              systemId: input.systemId,
+              idempotencyKey: input.idempotencyKey,
+              outcome: input.outcome,
+              payloadSummary: input.payloadSummary,
+              note: input.note,
+              isResend: input.isResend,
+            },
+            input.operator,
+          ),
+        ),
+      ),
+    merge: publicProcedure
+      .input(mergeInputSchema)
+      .mutation(({ input }) =>
+        execute(() =>
+          mergeResults(
+            input.state,
+            input.expectedRevision,
+            input.requestId,
+            input.note,
+            input.operator,
+          ),
+        ),
+      ),
     addConflict: publicProcedure
       .input(conflictInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          addConflict(input.state, input.requestId, input.conflict, input.operator),
+          addConflict(
+            input.state,
+            input.expectedRevision,
+            input.requestId,
+            input.conflict,
+            input.operator,
+          ),
         ),
       ),
     resolveConflict: publicProcedure
@@ -120,8 +190,9 @@ export const appRouter = t.router({
         execute(() =>
           resolveConflict(
             input.state,
+            input.expectedRevision,
             input.requestId,
-            input.conflictIndex,
+            input.conflictId,
             input.resolution,
             input.operator,
           ),
@@ -133,6 +204,7 @@ export const appRouter = t.router({
         execute(() =>
           extendRequest(
             input.state,
+            input.expectedRevision,
             input.requestId,
             input.days,
             input.reason,
@@ -146,6 +218,7 @@ export const appRouter = t.router({
         execute(() =>
           closeRequest(
             input.state,
+            input.expectedRevision,
             input.requestId,
             input.resultSummary,
             input.closureReason,
@@ -157,14 +230,26 @@ export const appRouter = t.router({
       .input(commentInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          addComment(input.state, input.requestId, input.content, input.operator),
+          addComment(
+            input.state,
+            input.expectedRevision,
+            input.requestId,
+            input.content,
+            input.operator,
+          ),
         ),
       ),
     recordExport: publicProcedure
       .input(recordExportInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          recordExport(input.state, input.scope, input.count, input.operator),
+          recordExport(
+            input.state,
+            input.expectedRevision,
+            input.scope,
+            input.count,
+            input.operator,
+          ),
         ),
       ),
   }),

@@ -39,7 +39,7 @@ export function DashboardPage() {
     (request) =>
       request.status === 'review-required' ||
       request.identity.status === 'insufficient' ||
-      request.conflicts.length > 0,
+      request.conflicts.some((conflict) => !conflict.resolved),
   )
   const overdueRequests = openRequests.filter(
     (request) => new Date(request.dueAt).getTime() < Date.now(),

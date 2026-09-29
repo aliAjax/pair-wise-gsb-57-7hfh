@@ -68,7 +68,7 @@ export function AuditPage() {
   function sanitizedPackage() {
     return {
       exportedAt: new Date().toISOString(),
-      policy: '用户隐私权利请求履约操作规范 v1',
+      policy: '用户隐私权利请求履约操作规范 v2（版本守卫、回执幂等、合并闸口、冻结期限模板）',
       summary: {
         requestCount: workspace.requests.length,
         openCount: workspace.requests.filter(
@@ -85,6 +85,7 @@ export function AuditPage() {
         status: request.status,
         requestedAt: request.requestedAt,
         dueAt: request.dueAt,
+        frozenDeadlineTemplate: request.deadlineTemplate,
         extendedDays: request.extendedDays,
         identity: {
           status: request.identity.status,
@@ -92,6 +93,8 @@ export function AuditPage() {
           maskedReference: request.identity.maskedReference,
           protectedDigest: request.identity.protectedDigest,
           note: request.identity.note,
+          reviewedAt: request.identity.reviewedAt,
+          reviewedBy: request.identity.reviewedBy,
         },
         affectedSystems: workspace.systems
           .filter((system) => request.affectedSystemIds.includes(system.id))
@@ -103,13 +106,35 @@ export function AuditPage() {
           completedAt: task.completedAt,
           exceptionReason: task.exceptionReason,
         })),
+        receipts: (request.receipts ?? []).map((receipt) => ({
+          system: workspace.systems.find((system) => system.id === receipt.systemId)?.name ?? receipt.systemId,
+          idempotencyKey: receipt.idempotencyKey,
+          status: receipt.status,
+          backfilled: receipt.backfilled ?? false,
+          firstReceivedAt: receipt.receivedAt,
+          attempts: receipt.attempts.map((attempt) => ({
+            kind: attempt.kind,
+            receivedAt: attempt.receivedAt,
+            operator: attempt.operator,
+            note: attempt.note,
+          })),
+        })),
+        mergedAt: request.merge?.mergedAt,
+        mergedBy: request.merge?.mergedBy,
         evidence: request.evidence.map((evidence) => ({
           name: evidence.name,
           type: evidence.evidenceType,
           digest: evidence.digest,
+          receiptKey: evidence.receiptKey,
           uploadedAt: evidence.uploadedAt,
         })),
-        conflicts: request.conflicts,
+        conflicts: request.conflicts.map((conflict) => ({
+          description: conflict.description,
+          resolved: conflict.resolved,
+          resolution: conflict.resolution,
+          resolvedBy: conflict.resolvedBy,
+          resolvedAt: conflict.resolvedAt,
+        })),
         resultSummary: request.resultSummary,
         closureReason: request.closureReason,
       })),

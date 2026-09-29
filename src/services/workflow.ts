@@ -1,16 +1,38 @@
 import type {
   DataSystem,
+  DeadlineTemplate,
+  Region,
   RequestStatus,
   RequestType,
   WorkflowStep,
 } from '@/types/domain'
 
-export const responseDays = {
-  cn: 30,
-  eu: 30,
-  us: 45,
-  sg: 30,
-} as const
+/**
+ * 各地区当前期限模板（带版本）。请求登记时冻结模板版本与天数，
+ * 之后这里调整（例如 cn 升到 2026-v2）只影响之后登记的请求；
+ * 已登记请求按 deadlineTemplate 快照沿用原期限。
+ */
+export const regionTemplates: Record<Region, { version: string; responseDays: number }> = {
+  cn: { version: '2026-v2', responseDays: 30 },
+  eu: { version: '2026-v1', responseDays: 30 },
+  us: { version: '2026-v1', responseDays: 45 },
+  sg: { version: '2026-v1', responseDays: 30 },
+}
+
+export const responseDays = Object.fromEntries(
+  Object.entries(regionTemplates).map(([region, template]) => [region, template.responseDays]),
+) as Record<Region, number>
+
+/** 登记时冻结当前地区模板。 */
+export function freezeTemplate(region: Region, frozenAt = new Date().toISOString()): DeadlineTemplate {
+  const template = regionTemplates[region]
+  return {
+    region,
+    version: template.version,
+    responseDays: template.responseDays,
+    frozenAt,
+  }
+}
 
 export function addDays(date: Date, days: number): Date {
   const next = new Date(date)
@@ -139,7 +161,7 @@ export function buildWorkflowSteps(params: {
   return steps
 }
 
-export function templateName(region: keyof typeof responseDays, type: RequestType): string {
+export function templateName(region: Region, type: RequestType, template?: DeadlineTemplate): string {
   const typeNames: Record<RequestType, string> = {
     access: '访问请求',
     rectification: '更正请求',
@@ -147,7 +169,9 @@ export function templateName(region: keyof typeof responseDays, type: RequestTyp
     'withdraw-consent': '撤回同意',
     restriction: '限制处理',
   }
-  return `${region.toUpperCase()} · ${typeNames[type]} · ${responseDays[region]} 日流程`
+  const days = template?.responseDays ?? regionTemplates[region].responseDays
+  const suffix = template ? `（冻结模板 ${template.version}）` : `（当前模板 ${regionTemplates[region].version}）`
+  return `${region.toUpperCase()} · ${typeNames[type]} · ${days} 日流程${suffix}`
 }
 
 export function deadlineState(dueAt: string, now = new Date()) {
